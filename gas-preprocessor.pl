@@ -99,6 +99,9 @@ my @ifstack;
 # pass 1: parse .macro
 # note that the handling of arguments is probably overly permissive vs. gas
 # but it should be the same for valid cases
+
+# print "Pass 1\n";
+
 while (<ASMFILE>) {
     # remove all comments (to avoid interfering with evaluating directives)
     s/$comm.*//x;
@@ -125,11 +128,15 @@ while (<ASMFILE>) {
         die ".section $1 unsupported; figure out the mach-o section name and add it";
     }
 
+    # Comment .file to avoid clang's bug when using -g with assembler.
+    # s/\.file/$comm.file/x;
+
     parse_line($_);
 }
 
 sub handle_if {
     my $line = $_[0];
+    # print "handle_if: line = \"$line\"\n";
     # handle .if directives; apple's assembler doesn't support important non-basic ones
     # evaluating them is also needed to handle recursive macros
     if ($line =~ /\.if(n?)([a-z]*)\s+(.*)/) {
@@ -146,12 +153,18 @@ sub handle_if {
             } else {
                 die "argument to .ifc not recognized";
             }
-        } elsif ($type eq "") {
+        } elsif ($type eq "" || $type eq "e") {
             $result ^= eval($expr) != 0;
         } elsif ($type eq "eq") {
             $result = eval($expr) == 0;
         } elsif ($type eq "lt") {
             $result = eval($expr) < 0;
+        } elsif ($type eq "le") {
+            $result = eval($expr) <= 0;
+        } elsif ($type eq "gt") {
+            $result = eval($expr) > 0;
+        } elsif ($type eq "ge") {
+            $result = eval($expr) >= 0;
         } else {
 	    chomp($line);
             die "unhandled .if varient. \"$line\"";
@@ -166,40 +179,17 @@ sub handle_if {
 sub parse_line {
     my $line = @_[0];
 
-    # evaluate .if blocks
-    if (scalar(@ifstack)) {
-        if (/\.endif/) {
-            pop(@ifstack);
-            return;
-        } elsif ($line =~ /\.elseif\s+(.*)/) {
-            if ($ifstack[-1] == 0) {
-                $ifstack[-1] = !!eval($1);
-            } elsif ($ifstack[-1] > 0) {
-                $ifstack[-1] = -$ifstack[-1];
-            }
-            return;
-        } elsif (/\.else/) {
-            $ifstack[-1] = !$ifstack[-1];
-            return;
-        } elsif (handle_if($line)) {
-            return;
-        }
-
-        # discard lines in false .if blocks
-        foreach my $i (0 .. $#ifstack) {
-            if ($ifstack[$i] <= 0) {
-                return;
-            }
-        }
-    }
+    # print "Parse line: $line";
 
     if (/\.macro/) {
         $macro_level++;
+        # print "macro_level changed to $macro_level\n";
         if ($macro_level > 1 && !$current_macro) {
             die "nested macros but we don't have master macro";
         }
     } elsif (/\.endm/) {
         $macro_level--;
+        # print "macro_level changed to $macro_level\n";
         if ($macro_level < 0) {
             die "unmatched .endm";
         } elsif ($macro_level == 0) {
@@ -236,16 +226,19 @@ sub parse_line {
             die "macro level without a macro name";
         }
     }
+
 }
 
 sub expand_macros {
     my $line = @_[0];
 
+    # print "expand_macros: $line";
+
     # handle .if directives; apple's assembler doesn't support important non-basic ones
     # evaluating them is also needed to handle recursive macros
-    if (handle_if($line)) {
-        return;
-    }
+    #if (handle_if($line)) {
+    #    return;
+    #}
 
     if (/\.purgem\s+([\d\w\.]+)/) {
         delete $macro_lines{$1};
@@ -339,12 +332,13 @@ sub expand_macros {
 }
 
 close(ASMFILE) or exit 1;
-open(ASMFILE, "|-", @gcc_cmd) or die "Error running assembler";
-#open(ASMFILE, ">/tmp/a.S") or die "Error running assembler";
+#open(ASMFILE, "|-", @gcc_cmd) or die "Error running assembler";
+#open(ASMFILE, ">/tmp/a.s") or die "Error running assembler";
 
 my @sections;
 my $num_repts;
-my $rept_lines;
+my @rept_lines;
+my $in_rept = 0;
 
 my %literal_labels;     # for ldr <reg>, =<expr>
 my $literal_num = 0;
@@ -353,9 +347,16 @@ my $in_irp = 0;
 my @irp_args;
 my $irp_param;
 
+my @pass2_lines;
+
 # pass 2: parse .rept and .if variants
 # NOTE: since we don't implement a proper parser, using .rept with a
 # variable assigned from .set is not supported
+#
+# .if may contain variables from .macro or .irp or .rept, thus we have
+# to put .if evaluation after all those things. - Holly Lee <holly.lee@gmail.com> June, 2012
+# print "Pass 2:\n";
+
 foreach my $line (@pass1_lines) {
     # handle .previous (only with regard to .section not .subsection)
     if ($line =~ /\.(section|text|const_data)/) {
@@ -402,24 +403,36 @@ foreach my $line (@pass1_lines) {
     if ($fix_unreq) {
         if ($line =~ /\.unreq\s+(.*)/) {
             $line = ".unreq " . lc($1) . "\n";
-            print ASMFILE ".unreq " . uc($1) . "\n";
+            #print ASMFILE ".unreq " . uc($1) . "\n";
+            push(@pass2_lines, ".unreq ".uc($1)."\n");
         }
     }
 
     if ($line =~ /\.rept\s+(.*)/) {
+        if ( $in_rept || $in_irp ) {
+           die "Sorry we didn't support nested .rept so far: $line\n";
+        }
+
+        $in_rept = 1;
         $num_repts = $1;
-        $rept_lines = "\n";
+        #$rept_lines = "\n";
+        @rept_lines = ();
 
         # handle the possibility of repeating another directive on the same line
         # .endr on the same line is not valid, I don't know if a non-directive is
         if ($num_repts =~ s/(\.\w+.*)//) {
-            $rept_lines .= "$1\n";
+            #$rept_lines .= "$1\n";
+            push(@rept_lines, "$1\n");
         }
         $num_repts = eval($num_repts);
     } elsif ($line =~ /\.irp\s+([\d\w\.]+)\s*(.*)/) {
+        if ( $in_irp || $in_rept ) {
+           die "We cannot handle nested .irp : $line\n";
+        }
         $in_irp = 1;
         $num_repts = 1;
-        $rept_lines = "\n";
+        #$rept_lines = "\n";
+        @rept_lines = ();
         $irp_param = $1;
 
         # only use whitespace as the separator
@@ -428,9 +441,13 @@ foreach my $line (@pass1_lines) {
         $irp_arglist =~ s/^\s+//;
         @irp_args = split(/\s+/, $irp_arglist);
     } elsif ($line =~ /\.irpc\s+([\d\w\.]+)\s*(.*)/) {
+        if ( $in_irp ) {
+           die "We cannot handle nested .irpc\n";
+        }
         $in_irp = 1;
         $num_repts = 1;
-        $rept_lines = "\n";
+        #$rept_lines = "\n";
+        @rept_lines = ();
         $irp_param = $1;
 
         my $irp_arglist = $2;
@@ -440,25 +457,106 @@ foreach my $line (@pass1_lines) {
     } elsif ($line =~ /\.endr/) {
         if ($in_irp != 0) {
             foreach my $i (@irp_args) {
-                my $line = $rept_lines;
-                $line =~ s/\\$irp_param/$i/g;
-                $line =~ s/\\\(\)//g;     # remove \()
-                print ASMFILE $line;
+                #my $line = $rept_lines;
+                foreach (@rept_lines) {
+                   my $line = $_;
+                   $line =~ s/\\$irp_param/$i/g;
+                   $line =~ s/\\\(\)//g;     # remove \()
+                   #print ASMFILE $line;
+                   push(@pass2_lines, $line);
+                }
             }
-        } else {
+            $in_irp = 0;
+            @irp_args = '';
+        } elsif ( $in_rept ) {
+            # print "endr rept: num_repts = $num_repts, rept_lines = @rept_lines\n";
             for (1 .. $num_repts) {
-                print ASMFILE $rept_lines;
+                #print ASMFILE $rept_lines;
+                #push(@pass2_lines, $rept_lines);
+                foreach (@rept_lines) {
+                   my $line = $_;
+                   # print "endr rept: push to pass2_lines: \"$line\"";
+                   push(@pass2_lines, $line);
+                }
             }
+            #$rept_lines = '';
+            @rept_lines = ();
+            $in_rept = 0;
         }
-        $rept_lines = '';
-        $in_irp = 0;
-        @irp_args = '';
-    } elsif ($rept_lines) {
-        $rept_lines .= $line;
+        else {
+            die "Unmatched .endr found\n";
+        }
+    # } elsif ($rept_lines) {
+    } elsif ( $in_rept || $in_irp ) {
+        #$rept_lines .= $line;
+        # print "should be in rept: push to rept_lines: \"$line\"";
+        push(@rept_lines, $line);
     } else {
-        print ASMFILE $line;
+        # print ASMFILE $line;
+        # print "regular: push to pass2_lines: \"$line\"";
+        push(@pass2_lines, $line);
     }
 }
+
+# Pass3: handle .if directives
+
+open(ASMFILE, "|-", @gcc_cmd) or die "Error running assembler";
+#open(ASMFILE, ">/tmp/a.s") or die "Error running assembler";
+
+# print "Pass 3:\n";
+
+foreach (@pass2_lines) {
+     
+    my $line = $_;
+   
+    # print $line;
+
+    # .if
+    if ( handle_if($line) ) {
+       #chomp($line);
+       #print "handled if. \"$line\" ifstack = @ifstack, scalar = ".scalar(@ifstack)."\n";
+       next;
+    }
+
+    # In .if block
+    if (scalar(@ifstack)) {
+       if ($line =~ /\.endif/) {
+          pop(@ifstack);
+          #print "endif. ifstack = @ifstack\n";
+          next; #return;
+       } elsif ($line =~ /\.elseif\s+(.*)/) {
+          if ($ifstack[-1] == 0) {
+             $ifstack[-1] = !!eval($1);
+          } elsif ($ifstack[-1] > 0) {
+             $ifstack[-1] = -$ifstack[-1];
+          }
+          next; #return;
+       } elsif ($line =~ /\.else/) {
+          $ifstack[-1] = !$ifstack[-1];
+          next; #return;
+       } elsif (handle_if($line)) {
+          next; #return;
+       }
+
+       # discard lines in false .if blocks
+       my $discard = 0;
+       foreach my $i (0 .. $#ifstack) {
+               if ($ifstack[$i] <= 0) {
+                  $discard = 1; 
+                  last;
+               }
+       }
+
+       if ( !$discard ) {
+          print ASMFILE $line;
+       }
+
+       next;
+    } 
+
+    # Others. output it
+    print ASMFILE $line;
+} 
 
 print ASMFILE ".text\n";
 foreach my $literal (keys %literal_labels) {
