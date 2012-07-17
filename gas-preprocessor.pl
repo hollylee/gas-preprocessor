@@ -500,6 +500,13 @@ foreach my $line (@pass1_lines) {
 
 # Pass3: handle .if directives
 
+# Hacks for clang: clang in LLVM 3.1 in Xcode 4.3.x with -g options generates dwarf-2 debug information. i
+# It also pass -g to as but as -g doesn't support those debug directives created by clang -g.
+
+if ( $gcc_cmd[0] =~ /clang$/ ) {
+   @gcc_cmd = grep { $_ ne '-g' } @gcc_cmd;
+}
+
 open(ASMFILE, "|-", @gcc_cmd) or die "Error running assembler";
 #open(ASMFILE, ">/tmp/a.s") or die "Error running assembler";
 
