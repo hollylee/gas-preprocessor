@@ -5,6 +5,8 @@
 # usage: set your assembler to be something like "perl gas-preprocessor.pl gcc"
 use strict;
 
+my $debug = 0;
+
 # Apple's gas is ancient and doesn't support modern preprocessing features like
 # .rept and has ugly macro syntax, among other things. Thus, this script
 # implements the subset of the gas preprocessor used by x264 and ffmpeg
@@ -51,7 +53,7 @@ if ((grep /^-c$/, @gcc_cmd) && !(grep /^-o/, @gcc_cmd)) {
 my $comm;
 
 # detect architecture from gcc binary name
-if      ($gcc_cmd[0] =~ /arm/) {
+if ($gcc_cmd[0] =~ /arm/) {
     $comm = '@';
 } elsif ($gcc_cmd[0] =~ /powerpc|ppc/) {
     $comm = '#';
@@ -100,7 +102,7 @@ my @ifstack;
 # note that the handling of arguments is probably overly permissive vs. gas
 # but it should be the same for valid cases
 
-# print "Pass 1\n";
+debug_print("Pass 1\n");
 
 while (<ASMFILE>) {
     # remove all comments (to avoid interfering with evaluating directives)
@@ -128,15 +130,18 @@ while (<ASMFILE>) {
         die ".section $1 unsupported; figure out the mach-o section name and add it";
     }
 
-    # Comment .file to avoid clang's bug when using -g with assembler.
-    # s/\.file/$comm.file/x;
-
     parse_line($_);
 }
 
+# handle .if line. return 1 if the line is .if and handled, otherwise return 0
 sub handle_if {
     my $line = $_[0];
-    # print "handle_if: line = \"$line\"\n";
+    debug_print("handle_if: line = \"$line\"\n");
+
+    if ( $macro_level > 0 ) {
+       return 0;
+    }
+
     # handle .if directives; apple's assembler doesn't support important non-basic ones
     # evaluating them is also needed to handle recursive macros
     if ($line =~ /\.if(n?)([a-z]*)\s+(.*)/) {
@@ -176,32 +181,83 @@ sub handle_if {
     }
 }
 
+sub debug_print {
+    if ( $debug ) {
+       print @_[0];
+    }
+}
+
+#
+# Note those .macro may be wrapped inside .if conditional blocks, so it is moved to .if processing flow instead.
+#
+# So in pass1, we just read and put lines into pass1_lines
+#
 sub parse_line {
+
     my $line = @_[0];
 
-    # print "Parse line: $line";
+    push(@pass1_lines, $line)
+}
+
+
+
+close(ASMFILE) or exit 1;
+#open(ASMFILE, "|-", @gcc_cmd) or die "Error running assembler";
+#open(ASMFILE, ">/tmp/a.s") or die "Error running assembler";
+
+my @sections;
+my $num_repts;
+my @rept_lines;
+my $in_rept = 0;
+
+my %literal_labels;     # for ldr <reg>, =<expr>
+my $literal_num = 0;
+
+my $in_irp = 0;
+my @irp_args;
+my $irp_param;
+
+my @pass2_lines;
+
+# return 1 to output, 0 if handled
+sub handle_macro {
+
+    my $line = @_[0];
+
+    debug_print("handle_macro: ".$line."\n");
 
     if (/\.macro/) {
         $macro_level++;
-        # print "macro_level changed to $macro_level\n";
+        debug_print("macro_level changed to $macro_level\n");
         if ($macro_level > 1 && !$current_macro) {
             die "nested macros but we don't have master macro";
         }
     } elsif (/\.endm/) {
         $macro_level--;
-        # print "macro_level changed to $macro_level\n";
+        debug_print("macro_level changed to $macro_level\n");
         if ($macro_level < 0) {
             die "unmatched .endm";
         } elsif ($macro_level == 0) {
             $current_macro = '';
-            return;
+            return 0;
         }
     }
 
+    debug_print("macro_level = ".$macro_level.". ".$line."\n");
+
     if ($macro_level > 1) {
+
+        debug_print("push ".$line." to macro ".$current_macro."\n");
+
         push(@{$macro_lines{$current_macro}}, $line);
+
+        return 0;
+
     } elsif ($macro_level == 0) {
-        expand_macros($line);
+
+         debug_print("expand_macro\n");
+
+         return expand_macros($line);
     } else {
         if (/\.macro\s+([\d\w\.]+)\s*(.*)/) {
             $current_macro = $1;
@@ -220,19 +276,26 @@ sub parse_line {
             # ensure %macro_lines has the macro name added as a key
             $macro_lines{$current_macro} = [];
 
+            debug_print("start macro: ".$current_macro."\n");
+
         } elsif ($current_macro) {
+
+            debug_print("push into macro: ".$current_macro."\n");
+
             push(@{$macro_lines{$current_macro}}, $line);
         } else {
             die "macro level without a macro name";
         }
+        
+        return 0;
     }
-
 }
 
+# return 1 if output needed, 0 if handled
 sub expand_macros {
     my $line = @_[0];
 
-    # print "expand_macros: $line";
+    debug_print("expand_macros: $line");
 
     # handle .if directives; apple's assembler doesn't support important non-basic ones
     # evaluating them is also needed to handle recursive macros
@@ -244,11 +307,18 @@ sub expand_macros {
         delete $macro_lines{$1};
         delete $macro_args{$1};
         delete $macro_args_default{$1};
-        return;
+        return 0;
     }
 
     if ($line =~ /(\S+:|)\s*([\w\d\.]+)\s*(.*)/ && exists $macro_lines{$2}) {
-        push(@pass1_lines, $1);
+
+        debug_print("matched macro (".$2."). label (".$1.")\n");
+
+        debug_print("Output label ".$1."\n");
+        print ASMFILE $1;
+
+        # push(@pass3_lines, $1);
+
         my $macro = $2;
 
         # commas are optional here too, but are syntactically important because
@@ -324,30 +394,111 @@ sub expand_macros {
                 $macro_line =~ s/\\$_/$replacements{$_}/g;
             }
             $macro_line =~ s/\\\(\)//g;     # remove \()
-            parse_line($macro_line);
+            #parse_line($macro_line);
+
+            debug_print("expand line: ".$macro_line."\n");
+
+            #if ( handle_macro($macro_line) ) {
+            #   print ASMFILE $macro_line;
+            #}
+            pass3_line($macro_line);
+
+            #return 0;
         }
+        return 0;
     } else {
-        push(@pass1_lines, $line);
+        #push(@pass1_lines, $line);
+        debug_print("directly output: ".$line."\n");
+
+        return 1;
     }
+
+} # expand_macros
+
+sub pass3_line {
+
+    my $line = @_[0];
+
+    debug_print("pass3_line: ".$line);
+
+    # handle_if returns 1 if line is .if 
+    if ( handle_if($line) ) {
+       #chomp($line);
+       debug_print("handled if. \"$line\" ifstack = @ifstack, scalar = ".scalar(@ifstack)."\n");
+       next;
+    }
+
+    # In .if block
+    if (scalar(@ifstack)) {
+       if ($line =~ /\.endif/) {
+          pop(@ifstack);
+          debug_print("endif. ifstack = @ifstack\n");
+          next; #return;
+       } elsif ($line =~ /\.elseif\s+(.*)/) {
+          if ($ifstack[-1] == 0) {
+             $ifstack[-1] = !!eval($1);
+          } elsif ($ifstack[-1] > 0) {
+             $ifstack[-1] = -$ifstack[-1];
+          }
+          next; #return;
+       } elsif ($line =~ /\.else/) {
+          $ifstack[-1] = !$ifstack[-1];
+          next; #return;
+       } elsif (handle_if($line)) {
+          next; #return;
+       }
+
+       # discard lines in false .if blocks
+       my $discard = 0;
+       foreach my $i (0 .. $#ifstack) {
+               if ($ifstack[$i] <= 0) {
+                  $discard = 1; 
+                  last;
+               }
+       }
+
+       if ( $discard ) {
+          next;
+          #print ASMFILE $line;
+       }
+
+    } # in .if block 
+
+    # Arrived here if in true if block or not in if block
+
+    # special ldr <reg> =<expr> 
+    $line = handle_ldr($line);
+
+    # macro?
+    if ( handle_macro($line) ) {
+       debug_print("handle_macro returned 1. Output ".$line);
+       print ASMFILE $line;
+    }
+
+} # pass3_line 
+
+sub handle_ldr {
+
+    my $line = @_[0];
+
+    if ($line =~ /(.*)\s*ldr([\w\s\d]+)\s*,\s*=(.*)/) {
+        my $label = $literal_labels{$3};
+        if (!$label) {
+            # $label = ".Literal_$literal_num";
+            $label = "Literal_$literal_num";
+            $literal_num++;
+            $literal_labels{$3} = $label;
+        }
+        $line = "$1 ldr$2, $label\n";
+    } elsif ($line =~ /\.ltorg/) {
+        foreach my $literal (keys %literal_labels) {
+            $line .= "$literal_labels{$literal}:\n .word $literal\n";
+        }
+        %literal_labels = ();
+    }
+
+    return $line;
 }
-
-close(ASMFILE) or exit 1;
-#open(ASMFILE, "|-", @gcc_cmd) or die "Error running assembler";
-#open(ASMFILE, ">/tmp/a.s") or die "Error running assembler";
-
-my @sections;
-my $num_repts;
-my @rept_lines;
-my $in_rept = 0;
-
-my %literal_labels;     # for ldr <reg>, =<expr>
-my $literal_num = 0;
-
-my $in_irp = 0;
-my @irp_args;
-my $irp_param;
-
-my @pass2_lines;
 
 # pass 2: parse .rept and .if variants
 # NOTE: since we don't implement a proper parser, using .rept with a
@@ -355,7 +506,7 @@ my @pass2_lines;
 #
 # .if may contain variables from .macro or .irp or .rept, thus we have
 # to put .if evaluation after all those things. - Holly Lee <holly.lee@gmail.com> June, 2012
-# print "Pass 2:\n";
+debug_print("Pass 2:\n");
 
 foreach my $line (@pass1_lines) {
     # handle .previous (only with regard to .section not .subsection)
@@ -369,21 +520,24 @@ foreach my $line (@pass1_lines) {
         push(@sections, $line);
     }
 
+    # The ldr <reg> =<expr> may expanded by macro, so move it to pass 3 - sub handle_ldr, returning $line
+
     # handle ldr <reg>, =<expr>
-    if ($line =~ /(.*)\s*ldr([\w\s\d]+)\s*,\s*=(.*)/) {
-        my $label = $literal_labels{$3};
-        if (!$label) {
-            $label = ".Literal_$literal_num";
-            $literal_num++;
-            $literal_labels{$3} = $label;
-        }
-        $line = "$1 ldr$2, $label\n";
-    } elsif ($line =~ /\.ltorg/) {
-        foreach my $literal (keys %literal_labels) {
-            $line .= "$literal_labels{$literal}:\n .word $literal\n";
-        }
-        %literal_labels = ();
-    }
+    #if ($line =~ /(.*)\s*ldr([\w\s\d]+)\s*,\s*=(.*)/) {
+    #    my $label = $literal_labels{$3};
+    #    if (!$label) {
+    #        # $label = ".Literal_$literal_num";
+    #        $label = "Literal_$literal_num";
+    #        $literal_num++;
+    #        $literal_labels{$3} = $label;
+    #    }
+    #    $line = "$1 ldr$2, $label\n";
+    #} elsif ($line =~ /\.ltorg/) {
+    #    foreach my $literal (keys %literal_labels) {
+    #        $line .= "$literal_labels{$literal}:\n .word $literal\n";
+    #    }
+    #    %literal_labels = ();
+    #}
 
     # @l -> lo16()  @ha -> ha16()
     $line =~ s/,\s+([^,]+)\@l\b/, lo16($1)/g;
@@ -500,7 +654,7 @@ foreach my $line (@pass1_lines) {
 
 # Pass3: handle .if directives
 
-# Hacks for clang: clang in LLVM 3.1 in Xcode 4.3.x with -g options generates dwarf-2 debug information. i
+# Hacks for clang: clang in LLVM 3.1 in Xcode 4.3.x or later with -g options generates dwarf-2 debug information. i
 # It also pass -g to as but as -g doesn't support those debug directives created by clang -g.
 
 if ( $gcc_cmd[0] =~ /clang$/ ) {
@@ -510,60 +664,11 @@ if ( $gcc_cmd[0] =~ /clang$/ ) {
 open(ASMFILE, "|-", @gcc_cmd) or die "Error running assembler";
 #open(ASMFILE, ">/tmp/a.s") or die "Error running assembler";
 
-# print "Pass 3:\n";
+debug_print("Pass 3:\n");
 
 foreach (@pass2_lines) {
-     
-    my $line = $_;
-   
-    # print $line;
-
-    # .if
-    if ( handle_if($line) ) {
-       #chomp($line);
-       #print "handled if. \"$line\" ifstack = @ifstack, scalar = ".scalar(@ifstack)."\n";
-       next;
-    }
-
-    # In .if block
-    if (scalar(@ifstack)) {
-       if ($line =~ /\.endif/) {
-          pop(@ifstack);
-          #print "endif. ifstack = @ifstack\n";
-          next; #return;
-       } elsif ($line =~ /\.elseif\s+(.*)/) {
-          if ($ifstack[-1] == 0) {
-             $ifstack[-1] = !!eval($1);
-          } elsif ($ifstack[-1] > 0) {
-             $ifstack[-1] = -$ifstack[-1];
-          }
-          next; #return;
-       } elsif ($line =~ /\.else/) {
-          $ifstack[-1] = !$ifstack[-1];
-          next; #return;
-       } elsif (handle_if($line)) {
-          next; #return;
-       }
-
-       # discard lines in false .if blocks
-       my $discard = 0;
-       foreach my $i (0 .. $#ifstack) {
-               if ($ifstack[$i] <= 0) {
-                  $discard = 1; 
-                  last;
-               }
-       }
-
-       if ( !$discard ) {
-          print ASMFILE $line;
-       }
-
-       next;
-    } 
-
-    # Others. output it
-    print ASMFILE $line;
-} 
+    pass3_line($_);
+}
 
 print ASMFILE ".text\n";
 foreach my $literal (keys %literal_labels) {
