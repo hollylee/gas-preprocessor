@@ -95,6 +95,8 @@ my %macro_lines;
 my %macro_args;
 my %macro_args_default;
 
+my $macro_executed_counter = 0;  # For \@ substitution 
+
 my @pass1_lines;
 my @ifstack;
 
@@ -105,8 +107,11 @@ my @ifstack;
 debug_print("Pass 1\n");
 
 while (<ASMFILE>) {
+
+    debug_print("Read source line $_");
+
     # remove all comments (to avoid interfering with evaluating directives)
-    s/$comm.*//x;
+    s/(?<!\\)$comm.*//x;
 
     # comment out unsupported directives
     s/\.type/$comm.type/x;
@@ -138,9 +143,9 @@ sub handle_if {
     my $line = $_[0];
     debug_print("handle_if: line = \"$line\"\n");
 
-    if ( $macro_level > 0 ) {
-       return 0;
-    }
+    #if ( $macro_level > 0 ) {
+    #   return 0;
+    #}
 
     # handle .if directives; apple's assembler doesn't support important non-basic ones
     # evaluating them is also needed to handle recursive macros
@@ -159,17 +164,17 @@ sub handle_if {
                 die "argument to .ifc not recognized";
             }
         } elsif ($type eq "" || $type eq "e") {
-            $result ^= eval($expr) != 0;
+            $result ^= eval_expr($expr) != 0;
         } elsif ($type eq "eq") {
-            $result = eval($expr) == 0;
+            $result = eval_expr($expr) == 0;
         } elsif ($type eq "lt") {
-            $result = eval($expr) < 0;
+            $result = eval_expr($expr) < 0;
         } elsif ($type eq "le") {
-            $result = eval($expr) <= 0;
+            $result = eval_expr($expr) <= 0;
         } elsif ($type eq "gt") {
-            $result = eval($expr) > 0;
+            $result = eval_expr($expr) > 0;
         } elsif ($type eq "ge") {
-            $result = eval($expr) >= 0;
+            $result = eval_expr($expr) >= 0;
         } else {
 	    chomp($line);
             die "unhandled .if varient. \"$line\"";
@@ -196,6 +201,8 @@ sub parse_line {
 
     my $line = @_[0];
 
+    debug_print("Read line $line, then push to pass 1\n");
+
     push(@pass1_lines, $line)
 }
 
@@ -219,6 +226,18 @@ my $irp_param;
 
 my @pass2_lines;
 
+my %symbols;  # Store symbol used in .set, .altmacro and .noaltmacro
+my $in_altmacro = 0;
+
+sub eval_expr {
+    my $expr = $_[0];
+    debug_print("eval_expr: $expr\n");
+    $expr =~ s/([A-Za-z._][A-Za-z0-9._]*)/$symbols{$1}/g;
+    debug_print("eval_expr to: $expr\n");
+    eval $expr;
+}
+
+
 # return 1 to output, 0 if handled
 sub handle_macro {
 
@@ -226,13 +245,13 @@ sub handle_macro {
 
     debug_print("handle_macro: ".$line."\n");
 
-    if (/\.macro/) {
+    if ( $line =~ /\.macro/) {
         $macro_level++;
         debug_print("macro_level changed to $macro_level\n");
         if ($macro_level > 1 && !$current_macro) {
             die "nested macros but we don't have master macro";
         }
-    } elsif (/\.endm/) {
+    } elsif ( $line =~ /\.endm/) {
         $macro_level--;
         debug_print("macro_level changed to $macro_level\n");
         if ($macro_level < 0) {
@@ -259,7 +278,7 @@ sub handle_macro {
 
          return expand_macros($line);
     } else {
-        if (/\.macro\s+([\d\w\.]+)\s*(.*)/) {
+        if ( $line =~ /\.macro\s+([\d\w\.]+)\s*(.*)/) {
             $current_macro = $1;
 
             # commas in the argument list are optional, so only use whitespace as the separator
@@ -276,11 +295,11 @@ sub handle_macro {
             # ensure %macro_lines has the macro name added as a key
             $macro_lines{$current_macro} = [];
 
-            debug_print("start macro: ".$current_macro."\n");
+            debug_print("start macro: $current_macro, args = $arglist\n");
 
         } elsif ($current_macro) {
 
-            debug_print("push into macro: ".$current_macro."\n");
+            debug_print("push into macro: $current_macro\n");
 
             push(@{$macro_lines{$current_macro}}, $line);
         } else {
@@ -312,7 +331,10 @@ sub expand_macros {
 
     if ($line =~ /(\S+:|)\s*([\w\d\.]+)\s*(.*)/ && exists $macro_lines{$2}) {
 
-        debug_print("matched macro (".$2."). label (".$1.")\n");
+        my $macro_executed_counter_in_this_scope = $macro_executed_counter++;
+
+ 
+        debug_print("matched macro (".$2."). label (".$1."), counter $macro_executed_counter\n");
 
         debug_print("Output label ".$1."\n");
         print ASMFILE $1;
@@ -329,9 +351,8 @@ sub expand_macros {
 
         my $comma_sep_required = 0;
         foreach (@arglist) {
-            # allow for + and - in macro arguments
-            $_ =~ s/\s*\+\s*/+/;
-            $_ =~ s/\s*\-\s*/-/;
+            # allow for +, -, *, /, >>, and << in macro arguments
+            $_ =~ s/\s*(\+|-|\*|\/|>>|<<)\s*/$1/g;
 
             my @whitespace_split = split(/\s+/, $_);
             if (!@whitespace_split) {
@@ -393,6 +414,7 @@ sub expand_macros {
             foreach (reverse sort {length $a <=> length $b} keys %replacements) {
                 $macro_line =~ s/\\$_/$replacements{$_}/g;
             }
+            $macro_line =~ s/\\\@/$macro_executed_counter_in_this_scope/g;       # replace \@
             $macro_line =~ s/\\\(\)//g;     # remove \()
             #parse_line($macro_line);
 
@@ -406,6 +428,28 @@ sub expand_macros {
             #return 0;
         }
         return 0;
+    }
+    # .set directive
+    elsif ( $line =~ /\.set\s+(.+)\s*,\s*(.+)/ ) {
+
+        debug_print("set symbol $1 to $symbols{$1}\n");
+
+	$symbols{$1} = eval_expr($2); 
+        return 1;   
+    }
+
+    # .altmacro
+    elsif ( $line =~ /.altmacro/ ) {
+        $in_altmacro = 1;
+        return 0;
+    }
+    
+    # .noaltmacro
+    elsif ( $line =~ /.noaltmacro/ ) {
+        $in_altmacro = 0;
+        return 0;
+
+    # Others
     } else {
         #push(@pass1_lines, $line);
         debug_print("directly output: ".$line."\n");
@@ -419,55 +463,64 @@ sub pass3_line {
 
     my $line = @_[0];
 
-    debug_print("pass3_line: ".$line);
+    debug_print("pass3_line: $line, macro_level = $macro_level\n");
 
-    # handle_if returns 1 if line is .if 
-    if ( handle_if($line) ) {
-       #chomp($line);
-       debug_print("handled if. \"$line\" ifstack = @ifstack, scalar = ".scalar(@ifstack)."\n");
-       next;
-    }
+    if ( $macro_level == 0 ) {
 
-    # In .if block
-    if (scalar(@ifstack)) {
-       if ($line =~ /\.endif/) {
-          pop(@ifstack);
-          debug_print("endif. ifstack = @ifstack\n");
-          next; #return;
-       } elsif ($line =~ /\.elseif\s+(.*)/) {
-          if ($ifstack[-1] == 0) {
-             $ifstack[-1] = !!eval($1);
-          } elsif ($ifstack[-1] > 0) {
-             $ifstack[-1] = -$ifstack[-1];
-          }
-          next; #return;
-       } elsif ($line =~ /\.else/) {
-          $ifstack[-1] = !$ifstack[-1];
-          next; #return;
-       } elsif (handle_if($line)) {
-          next; #return;
+       if ( $in_altmacro ) {
+          $line =~ s/\%([^,]*)/eval_expr($1)/eg if $in_altmacro;
+          debug_print("in altmacro: ".$line);
        }
 
-       # discard lines in false .if blocks
-       my $discard = 0;
-       foreach my $i (0 .. $#ifstack) {
-               if ($ifstack[$i] <= 0) {
-                  $discard = 1; 
-                  last;
-               }
-       }
-
-       if ( $discard ) {
+       # handle_if returns 1 if line is .if 
+       if ( handle_if($line) ) {
+          #chomp($line);
+          debug_print("handled if. \"$line\" ifstack = @ifstack, scalar = ".scalar(@ifstack)."\n");
           next;
-          #print ASMFILE $line;
        }
 
-    } # in .if block 
+       # In .if block
+       if (scalar(@ifstack)) {
+          if ($line =~ /\.endif/) {
+             pop(@ifstack);
+             debug_print("endif. ifstack = @ifstack\n");
+             next; #return;
+          } elsif ($line =~ /\.elseif\s+(.*)/) {
+             if ($ifstack[-1] == 0) {
+                $ifstack[-1] = !!eval_expr($1);
+             } elsif ($ifstack[-1] > 0) {
+                $ifstack[-1] = -$ifstack[-1];
+             }
+             next; #return;
+          } elsif ($line =~ /\.else/) {
+             $ifstack[-1] = !$ifstack[-1];
+             next; #return;
+          } elsif (handle_if($line)) {
+             next; #return;
+          }
 
-    # Arrived here if in true if block or not in if block
+          # discard lines in false .if blocks
+          my $discard = 0;
+          foreach my $i (0 .. $#ifstack) {
+                  if ($ifstack[$i] <= 0) {
+                     $discard = 1; 
+                     last;
+                  }
+          }
 
-    # special ldr <reg> =<expr> 
-    $line = handle_ldr($line);
+          if ( $discard ) {
+             next;
+             #print ASMFILE $line;
+          }
+
+       } # in .if block 
+
+       # Arrived here if in true if block or not in if block
+
+       # special ldr <reg> =<expr> 
+       $line = handle_ldr($line);
+
+    } # $macro_level == 0
 
     # macro?
     if ( handle_macro($line) ) {
@@ -484,8 +537,8 @@ sub handle_ldr {
     if ($line =~ /(.*)\s*ldr([\w\s\d]+)\s*,\s*=(.*)/) {
         my $label = $literal_labels{$3};
         if (!$label) {
-            # $label = ".Literal_$literal_num";
-            $label = "Literal_$literal_num";
+            $label = ".Literal_$literal_num";
+            #$label = "Literal_$literal_num";
             $literal_num++;
             $literal_labels{$3} = $label;
         }
@@ -509,6 +562,9 @@ sub handle_ldr {
 debug_print("Pass 2:\n");
 
 foreach my $line (@pass1_lines) {
+
+    debug_print("Read pass 1 line: $line\n");
+
     # handle .previous (only with regard to .section not .subsection)
     if ($line =~ /\.(section|text|const_data)/) {
         push(@sections, $line);
@@ -648,6 +704,7 @@ foreach my $line (@pass1_lines) {
     } else {
         # print ASMFILE $line;
         # print "regular: push to pass2_lines: \"$line\"";
+        debug_print("Write pass 2 line: $line\n");
         push(@pass2_lines, $line);
     }
 }
@@ -661,8 +718,12 @@ if ( $gcc_cmd[0] =~ /clang$/ ) {
    @gcc_cmd = grep { $_ ne '-g' } @gcc_cmd;
 }
 
-open(ASMFILE, "|-", @gcc_cmd) or die "Error running assembler";
-#open(ASMFILE, ">/tmp/a.s") or die "Error running assembler";
+if ( $debug ) {
+   open(ASMFILE, ">/tmp/a.s") or die "Error running assembler";
+}
+else {
+   open(ASMFILE, "|-", @gcc_cmd) or die "Error running assembler";
+}
 
 debug_print("Pass 3:\n");
 
