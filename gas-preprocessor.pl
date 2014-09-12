@@ -51,6 +51,7 @@ if ((grep /^-c$/, @gcc_cmd) && !(grep /^-o/, @gcc_cmd)) {
 @preprocess_c_cmd = map { /\.o$/ ? "-" : $_ } @preprocess_c_cmd;
 
 my $comm;
+my $is_arm64 = 0;
 
 # detect architecture from gcc binary name
 if ($gcc_cmd[0] =~ /arm/) {
@@ -62,7 +63,10 @@ if ($gcc_cmd[0] =~ /arm/) {
 # look for -arch flag
 foreach my $i (1 .. $#gcc_cmd-1) {
     if ($gcc_cmd[$i] eq "-arch") {
-        if ($gcc_cmd[$i+1] =~ /arm/) {
+        if ( $gcc_cmd[$i+1] =~ /arm64/ || $gcc_cmd[$i+1] =~ /aarch64/ ) {
+            $comm = ';';
+            $is_arm64 = 1;
+        } elsif ($gcc_cmd[$i+1] =~ /arm/) {
             $comm = '@';
         } elsif ($gcc_cmd[$i+1] =~ /powerpc|ppc/) {
             $comm = '#';
@@ -73,7 +77,10 @@ foreach my $i (1 .. $#gcc_cmd-1) {
 # assume we're not cross-compiling if no -arch or the binary doesn't have the arch name
 if (!$comm) {
     my $native_arch = qx/arch/;
-    if ($native_arch =~ /arm/) {
+    if ($native_arch =~ /arm64/ || $native_arch =~ /aarch64/) {
+        $comm = ';';
+        $is_arm64 = 1;
+    } elsif ($native_arch =~ /arm/) {
         $comm = '@';
     } elsif ($native_arch =~ /powerpc|ppc/) {
         $comm = '#';
@@ -99,6 +106,9 @@ my $macro_executed_counter = 0;  # For \@ substitution
 
 my @pass1_lines;
 my @ifstack;
+
+# for .req and .unreq
+my %register_aliases;
 
 # pass 1: parse .macro
 # note that the handling of arguments is probably overly permissive vs. gas
@@ -517,8 +527,35 @@ sub pass3_line {
 
        # Arrived here if in true if block or not in if block
 
+       # clang's internal assembler doesn't support .req and .unreq, and in arm64, as uses clang's internal assembler.
+       if ( $is_arm64 && $gcc_cmd[0] =~ /clang/ ) {
+          # sym .req rn
+          if ( $line =~ /([\w\d]+)\s+\.req\s+([\w\d]+)/ ) {
+             $register_aliases{$1} = $2;
+	     $line = $comm.$line;
+          }
+
+          # .unreq sym
+          elsif ( $line =~ /\.unreq\s+([\w\d]+)/ ) {
+             delete $register_aliases{$1};
+             $line = $comm.$line;
+          }
+
+          # replace register alias
+          else {
+             foreach (keys %register_aliases) {
+                my $alias = $_;
+                my $register_name = $register_aliases{$alias};
+                while (exists $register_aliases{$register_name}) {
+                      $register_name = $register_aliases{$register_name};
+                }
+                $line =~ s/\b$alias\b/$register_name/g;
+             }
+          }
+       }
+
        # special ldr <reg> =<expr> 
-       $line = handle_ldr($line);
+       $line = handle_special_insns($line);
 
     } # $macro_level == 0
 
@@ -530,7 +567,7 @@ sub pass3_line {
 
 } # pass3_line 
 
-sub handle_ldr {
+sub handle_special_insns {
 
     my $line = @_[0];
 
@@ -548,6 +585,23 @@ sub handle_ldr {
             $line .= "$literal_labels{$literal}:\n .word $literal\n";
         }
         %literal_labels = ();
+    } elsif ($line =~  /^(.*)\s*movi\s+(.*)\s*,\s*(#\d+)\s*\n*$/) {
+        $line = "$1 movi $2, $3, LSL #0\n";
+    }
+
+    # adrp: gas uses "adrp <reg>, :pg_hi21:<label>", we need "adrp <reg>, <label>@PAGE"
+    elsif ( $line =~ /^(.*)\s*adrp\s+(.*)\s*,\s*:pg_hi21:(.*)\s*/ ) {
+        $line = "$1 adrp $2, $3\@PAGE\n";
+    }
+ 
+    # add: gas uses "add <reg>, :lo12:<label>", we need "add <reg>, <label>@PAGEOFF"
+    elsif ( $line =~ /^(.*)\s*add\s+(.*)\s*,\s*:lo12:(.*)\s*/ ) {
+        $line = "$1 add $2, $3\@PAGEOFF\n";
+    }
+
+    # Apple as doesn't accept 'mov Vd.<T>. vn.<T>'. Use alias 'ORR Vd.<T>, Vn.<T>, Vn.<T>' to replace
+    elsif ( $line =~ /(.*)\s*mov\s+(v\d+\.(8|16)B)\s*,\s*(v\d+\.(8|16)B)\s*\n/ ) {
+        $line = "$1 orr $2, $4, $4\n";
     }
 
     return $line;
@@ -611,7 +665,7 @@ foreach my $line (@pass1_lines) {
     # old gas versions store upper and lower case names on .req,
     # but they remove only one on .unreq
     if ($fix_unreq) {
-        if ($line =~ /\.unreq\s+(.*)/) {
+        if ($line =~ /^\s*\.unreq\s+(.*)/ ) {
             $line = ".unreq " . lc($1) . "\n";
             #print ASMFILE ".unreq " . uc($1) . "\n";
             push(@pass2_lines, ".unreq ".uc($1)."\n");
@@ -711,7 +765,7 @@ foreach my $line (@pass1_lines) {
 
 # Pass3: handle .if directives
 
-# Hacks for clang: clang in LLVM 3.1 in Xcode 4.3.x or later with -g options generates dwarf-2 debug information. i
+# Hacks for clang: clang in LLVM 3.1 in Xcode 4.3.x or later with -g options generates dwarf-2 debug information.
 # It also pass -g to as but as -g doesn't support those debug directives created by clang -g.
 
 if ( $gcc_cmd[0] =~ /clang$/ ) {
