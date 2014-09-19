@@ -17,13 +17,35 @@ my @preprocess_c_cmd;
 
 my $fix_unreq = $^O eq "darwin";
 
-if ($gcc_cmd[0] eq "-fix-unreq") {
-    $fix_unreq = 1;
-    shift @gcc_cmd;
-} elsif ($gcc_cmd[0] eq "-no-fix-unreq") {
-    $fix_unreq = 0;
-    shift @gcc_cmd;
+# new ffmpeg versions (from 2.4) uses gas-preprocessor as format:
+#     gas-preprocessor -arch <arch> -as-type <as-type> -- $as
+# to support armasm, etc.
+#
+# I don't have this requirement so I just ignore -arch and -as-type options  before -- to make it compatible
+ 
+while ( @ARGV ) {
+     my $option = shift;
+     if ($option eq "-fix-unreq") {
+        $fix_unreq = 1;
+     } elsif ($option eq "-no-fix-unreq") {
+        $fix_unreq = 0;
+     }
+     elsif ($option eq "--") {
+        @gcc_cmd = @ARGV; 
+        last;
+     }
+     # ignore other new options
+     elsif ($option eq "-arch") {
+        shift;
+     }
+     elsif ($option eq "-as-type") {
+        shift;
+     }
+     else {
+        shift;
+     }
 }
+
 
 if (grep /\.c$/, @gcc_cmd) {
     # C file (inline asm?) - compile
@@ -31,6 +53,10 @@ if (grep /\.c$/, @gcc_cmd) {
 } elsif (grep /\.[sS]$/, @gcc_cmd) {
     # asm file, just do C preprocessor
     @preprocess_c_cmd = (@gcc_cmd, "-E");
+} 
+elsif (grep /^-v$/, @gcc_cmd) {
+    # -v: show version, for compiler tests.
+    exit 0;
 } else {
     die "Unrecognized input filetype";
 }
@@ -586,7 +612,16 @@ sub handle_special_insns {
         }
         %literal_labels = ();
     } elsif ($line =~  /^(.*)\s*movi\s+(.*)\s*,\s*(#\d+)\s*\n*$/) {
-        $line = "$1 movi $2, $3, LSL #0\n";
+        # Special case: 'movi vn.2d, #uimm64' and 'movi Dn, #uimm64'
+        my $label = $1;
+        my $reg = $2;
+        my $imm = $3;
+        if ( $reg =~ /([vV]\d+\.2[dD]|[dD]\d+)/ ) {
+           $line = "$label movi $reg, $imm\n";
+        }
+        else {
+           $line = "$label movi $reg, $imm, LSL #0\n";
+        }
     }
 
     # adrp: gas uses "adrp <reg>, :pg_hi21:<label>", we need "adrp <reg>, <label>@PAGE"
@@ -600,7 +635,7 @@ sub handle_special_insns {
     }
 
     # Apple as doesn't accept 'mov Vd.<T>. vn.<T>'. Use alias 'ORR Vd.<T>, Vn.<T>, Vn.<T>' to replace
-    elsif ( $line =~ /(.*)\s*mov\s+(v\d+\.(8|16)B)\s*,\s*(v\d+\.(8|16)B)\s*\n/ ) {
+    elsif ( $line =~ /(.*)\s*mov\s+(v\d+\.(8|16)[bB])\s*,\s*(v\d+\.(8|16)[bB])\s*\n/ ) {
         $line = "$1 orr $2, $4, $4\n";
     }
 
